@@ -33,6 +33,7 @@ from diffusers import (
     CogVideoXVideoToVideoPipeline,
 )
 from diffusers.utils import export_to_video, load_image, load_video
+from physics_guidance import PhysicsGuidanceConfig, VJEPAPhysicsGuidance
 
 
 logging.basicConfig(level=logging.INFO)
@@ -66,6 +67,14 @@ def generate_video(
     generate_type: str = Literal["t2v", "i2v", "v2v"],  # i2v: image to video, v2v: video to video
     seed: int = 42,
     fps: int = 16,
+    physics_guidance_scale: float = 0.0,
+    physics_guidance_model: str = "facebook/vjepa2-vitl-fpc64-256",
+    physics_guidance_interval: int = 10,
+    physics_guidance_start_step: int = 20,
+    physics_guidance_end_step: int = 45,
+    physics_guidance_frames: int = 16,
+    physics_guidance_epsilon: float = 0.01,
+    physics_guidance_device: str = "auto",
 ):
     """
     Generates a video based on the given prompt and saves it to the specified path.
@@ -83,7 +92,7 @@ def generate_video(
     - guidance_scale (float): The scale for classifier-free guidance. Higher values can lead to better alignment with the prompt.
     - num_videos_per_prompt (int): Number of videos to generate per prompt.
     - dtype (torch.dtype): The data type for computation (default is torch.bfloat16).
-    - generate_type (str): The type of video generation (e.g., 't2v', 'i2v', 'v2v').·
+    - generate_type (str): The type of video generation (e.g., 't2v', 'i2v', 'v2v').쨌
     - seed (int): The seed for reproducibility.
     - fps (int): The frames per second for the generated video.
     """
@@ -151,6 +160,25 @@ def generate_video(
     pipe.vae.enable_slicing()
     pipe.vae.enable_tiling()
 
+    physics_guidance = None
+    if physics_guidance_scale > 0:
+        if generate_type != "t2v":
+            raise ValueError("V-JEPA physics guidance currently supports only t2v generation.")
+        physics_guidance = VJEPAPhysicsGuidance(
+            pipe,
+            PhysicsGuidanceConfig(
+                scale=physics_guidance_scale,
+                model_id=physics_guidance_model,
+                interval=physics_guidance_interval,
+                start_step=physics_guidance_start_step,
+                end_step=physics_guidance_end_step,
+                num_frames=physics_guidance_frames,
+                fd_epsilon=physics_guidance_epsilon,
+                seed=seed,
+                device=physics_guidance_device,
+            ),
+        )
+
     # 4. Generate the video frames based on the prompt.
     # `num_frames` is the Number of frames to generate.
     if generate_type == "i2v":
@@ -178,6 +206,8 @@ def generate_video(
             use_dynamic_cfg=True,
             guidance_scale=guidance_scale,
             generator=torch.Generator().manual_seed(seed),
+            callback_on_step_end=physics_guidance,
+            callback_on_step_end_tensor_inputs=["latents"],
         ).frames[0]
     else:
         video_generate = pipe(
@@ -248,6 +278,29 @@ if __name__ == "__main__":
         "--dtype", type=str, default="bfloat16", help="The data type for computation"
     )
     parser.add_argument("--seed", type=int, default=42, help="The seed for reproducibility")
+    parser.add_argument(
+        "--physics_guidance_scale",
+        type=float,
+        default=0.0,
+        help="V-JEPA latent correction strength. Zero keeps the original baseline.",
+    )
+    parser.add_argument(
+        "--physics_guidance_model",
+        type=str,
+        default="facebook/vjepa2-vitl-fpc64-256",
+        help="Hugging Face V-JEPA 2 checkpoint.",
+    )
+    parser.add_argument("--physics_guidance_interval", type=int, default=10)
+    parser.add_argument("--physics_guidance_start_step", type=int, default=20)
+    parser.add_argument("--physics_guidance_end_step", type=int, default=45)
+    parser.add_argument("--physics_guidance_frames", type=int, default=16)
+    parser.add_argument("--physics_guidance_epsilon", type=float, default=0.01)
+    parser.add_argument(
+        "--physics_guidance_device",
+        type=str,
+        default="auto",
+        help="Guide device, for example auto, cuda, or cpu.",
+    )
 
     args = parser.parse_args()
     dtype = torch.float16 if args.dtype == "float16" else torch.bfloat16
@@ -268,7 +321,14 @@ if __name__ == "__main__":
         generate_type=args.generate_type,
         seed=args.seed,
         fps=args.fps,
+        physics_guidance_scale=args.physics_guidance_scale,
+        physics_guidance_model=args.physics_guidance_model,
+        physics_guidance_interval=args.physics_guidance_interval,
+        physics_guidance_start_step=args.physics_guidance_start_step,
+        physics_guidance_end_step=args.physics_guidance_end_step,
+        physics_guidance_frames=args.physics_guidance_frames,
+        physics_guidance_epsilon=args.physics_guidance_epsilon,
+        physics_guidance_device=args.physics_guidance_device,
     )
 
-    # python inference/cli_demo.py --prompt "텍스트프롬프트" --model_path THUDM/CogVideoX-2b --generate_type t2v --output_path outputs/파일명.mp4 --num_inference_steps 50 --num_frames 49 --guidance_scale 6.0 --seed 42 --dtype float16 --fps 8
-
+    # python inference/cli_demo.py --prompt "�띿뒪�명봽濡ы봽��" --model_path THUDM/CogVideoX-2b --generate_type t2v --output_path outputs/�뚯씪紐�.mp4 --num_inference_steps 50 --num_frames 49 --guidance_scale 6.0 --seed 42 --dtype float16 --fps 8
