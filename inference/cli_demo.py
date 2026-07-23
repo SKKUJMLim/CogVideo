@@ -270,8 +270,5 @@ if __name__ == "__main__":
         fps=args.fps,
     )
 
-    # python inference/cli_demo.py --prompt "A burning matchstick falls into a clear glass of water." --model_path THUDM/CogVideoX-2b --generate_type t2v --output_path outputs/matchstick_baseline.mp4 --num_inference_steps 50 --num_frames 49 --guidance_scale 6.0 --seed 42 --dtype float16 --fps 8
-    # Maple syrup drizzling from a bottle onto pancakes.
-    # Glass shatters on the floor.
-    # python inference/cli_demo.py --prompt "텍스트_프롬프트_추가" --model_path THUDM/CogVideoX-2b --generate_type t2v --output_path outputs/matchstick_baseline.mp4 --num_inference_steps 50 --num_frames 49 --guidance_scale 6.0 --seed 42 --dtype float16 --fps 8
+    # python inference/cli_demo.py --prompt "텍스트프롬프트" --model_path THUDM/CogVideoX-2b --generate_type t2v --output_path outputs/파일명.mp4 --num_inference_steps 50 --num_frames 49 --guidance_scale 6.0 --seed 42 --dtype float16 --fps 8
 
