@@ -164,3 +164,4 @@ class VJEPAPhysicsGuidance:
             gradient_rms.mean().item(),
         )
         return callback_kwargs
+

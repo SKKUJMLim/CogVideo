@@ -54,3 +54,4 @@ baseline.
   V-JEPA.
 - `--physics_guidance_epsilon`: pixel-space finite-difference magnitude.
 - `--physics_guidance_device`: `auto`, `cuda`, or `cpu`.
+

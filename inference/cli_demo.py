@@ -92,7 +92,7 @@ def generate_video(
     - guidance_scale (float): The scale for classifier-free guidance. Higher values can lead to better alignment with the prompt.
     - num_videos_per_prompt (int): Number of videos to generate per prompt.
     - dtype (torch.dtype): The data type for computation (default is torch.bfloat16).
-    - generate_type (str): The type of video generation (e.g., 't2v', 'i2v', 'v2v').쨌
+    - generate_type (str): The type of video generation (e.g., 't2v', 'i2v', 'v2v').·
     - seed (int): The seed for reproducibility.
     - fps (int): The frames per second for the generated video.
     """
@@ -331,4 +331,4 @@ if __name__ == "__main__":
         physics_guidance_device=args.physics_guidance_device,
     )
 
-    # python inference/cli_demo.py --prompt "�띿뒪�명봽濡ы봽��" --model_path THUDM/CogVideoX-2b --generate_type t2v --output_path outputs/�뚯씪紐�.mp4 --num_inference_steps 50 --num_frames 49 --guidance_scale 6.0 --seed 42 --dtype float16 --fps 8
+    # python inference/cli_demo.py --prompt "텍스트프롬프트" --model_path THUDM/CogVideoX-2b --generate_type t2v --output_path outputs/파일명.mp4 --num_inference_steps 50 --num_frames 49 --guidance_scale 6.0 --seed 42 --dtype float16 --fps 8
