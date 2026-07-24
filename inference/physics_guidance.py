@@ -411,17 +411,17 @@ class VJEPAPhysicsGuidance:
                 dtype=latents.dtype,
             )
 
-            direction_norm = (
-                direction
-                .flatten(1)
-                .norm(dim=1)
-                .clamp_min(1e-8)
+            dims = tuple(range(1, direction.ndim))
+
+            direction_rms = (
+                direction.float()
+                .square()
+                .mean(dim=dims, keepdim=True)
+                .sqrt()
+                .clamp_min(1e-6)
             )
 
-            direction = direction / direction_norm.view(
-                -1,
-                *([1] * (direction.ndim - 1)),
-            ).to(direction.dtype)
+            direction = direction / direction_rms.to(direction.dtype)
 
             # E(z)
             base_energy, energy_probes = self._energy(
