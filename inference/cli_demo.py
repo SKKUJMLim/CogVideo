@@ -173,7 +173,7 @@ def generate_video(
                 start_step=physics_guidance_start_step,
                 end_step=physics_guidance_end_step,
                 num_frames=physics_guidance_frames,
-                energy_epsilon=args.physics_guidance_epsilon,
+                fd_epsilon=physics_guidance_epsilon,
                 seed=seed,
                 device=physics_guidance_device,
             ),
