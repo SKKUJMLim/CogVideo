@@ -74,6 +74,9 @@ def generate_video(
     physics_guidance_end_step: int = 45,
     physics_guidance_frames: int = 16,
     physics_guidance_epsilon: float = 0.01,
+    physics_guidance_directions: int = 1,
+    physics_guidance_latent_epsilon: float = 0.05,
+    physics_guidance_maximize: bool = False,
     physics_guidance_device: str = "auto",
 ):
     """
@@ -173,7 +176,10 @@ def generate_video(
                 start_step=physics_guidance_start_step,
                 end_step=physics_guidance_end_step,
                 num_frames=physics_guidance_frames,
-                fd_epsilon=physics_guidance_epsilon,
+                energy_epsilon=physics_guidance_epsilon,
+                energy_num_directions=physics_guidance_directions,
+                latent_epsilon=physics_guidance_latent_epsilon,
+                maximize=physics_guidance_maximize,
                 seed=seed,
                 device=physics_guidance_device,
             ),
@@ -295,6 +301,15 @@ if __name__ == "__main__":
     parser.add_argument("--physics_guidance_end_step", type=int, default=45)
     parser.add_argument("--physics_guidance_frames", type=int, default=16)
     parser.add_argument("--physics_guidance_epsilon", type=float, default=0.01)
+    parser.add_argument("--physics_guidance_directions", type=int, default=1)
+    parser.add_argument(
+        "--physics_guidance_latent_epsilon", type=float, default=0.05
+    )
+    parser.add_argument(
+        "--physics_guidance_maximize",
+        action="store_true",
+        help="Maximize JEPA energy. The default minimizes it.",
+    )
     parser.add_argument(
         "--physics_guidance_device",
         type=str,
@@ -328,6 +343,9 @@ if __name__ == "__main__":
         physics_guidance_end_step=args.physics_guidance_end_step,
         physics_guidance_frames=args.physics_guidance_frames,
         physics_guidance_epsilon=args.physics_guidance_epsilon,
+        physics_guidance_directions=args.physics_guidance_directions,
+        physics_guidance_latent_epsilon=args.physics_guidance_latent_epsilon,
+        physics_guidance_maximize=args.physics_guidance_maximize,
         physics_guidance_device=args.physics_guidance_device,
     )
 

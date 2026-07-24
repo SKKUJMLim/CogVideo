@@ -1,8 +1,9 @@
-"""V-JEPA 2 guidance for CogVideoX inference.
+"""Memory-efficient V-JEPA 2 guidance for CogVideoX inference.
 
-The guide minimizes a finite-difference approximation of the local Jacobian
-energy of V-JEPA 2 features with respect to the decoded video.  It is designed
-to be used as a ``callback_on_step_end`` callback in Diffusers.
+The guide estimates V-JEPA Jacobian energy in pixel space, then estimates its
+directional derivative in latent space using forward finite differences.  All
+VAE and V-JEPA evaluations run without autograd so the callback does not retain
+a full video-backpropagation graph.
 """
 
 import logging
@@ -25,7 +26,10 @@ class PhysicsGuidanceConfig:
     start_step: int = 20
     end_step: int = 45
     num_frames: int = 16
-    fd_epsilon: float = 0.01
+    energy_epsilon: float = 0.01
+    energy_num_directions: int = 1
+    latent_epsilon: float = 0.05
+    maximize: bool = False
     seed: int = 0
     device: str = "auto"
 
@@ -41,8 +45,12 @@ class VJEPAPhysicsGuidance:
             raise ValueError("Physics guidance scale must be greater than zero.")
         if config.interval < 1:
             raise ValueError("Physics guidance interval must be at least one.")
-        if config.fd_epsilon <= 0:
-            raise ValueError("Finite-difference epsilon must be greater than zero.")
+        if config.energy_epsilon <= 0:
+            raise ValueError("Energy epsilon must be greater than zero.")
+        if config.energy_num_directions < 1:
+            raise ValueError("Energy directions must be at least one.")
+        if config.latent_epsilon <= 0:
+            raise ValueError("Latent finite-difference epsilon must be greater than zero.")
 
         if config.device == "auto":
             self.device = pipeline._execution_device
@@ -53,15 +61,10 @@ class VJEPAPhysicsGuidance:
         self.processor = AutoVideoProcessor.from_pretrained(config.model_id)
         self.model = AutoModel.from_pretrained(
             config.model_id,
-            torch_dtype=self.dtype,
+            dtype=self.dtype,
             attn_implementation="sdpa",
         ).eval().to(self.device)
         self.model.requires_grad_(False)
-
-        # Backpropagating through a video ViT is expensive. Checkpointing makes
-        # the guide practical on a single GPU at the cost of extra compute.
-        if hasattr(self.model, "gradient_checkpointing_enable"):
-            self.model.gradient_checkpointing_enable()
 
         self.image_mean = torch.tensor(
             getattr(self.processor, "image_mean", [0.485, 0.456, 0.406]),
@@ -74,12 +77,19 @@ class VJEPAPhysicsGuidance:
             dtype=self.dtype,
         ).view(1, 1, 3, 1, 1)
         crop_size = getattr(self.processor, "crop_size", {"height": 256, "width": 256})
-        if isinstance(crop_size, dict):
-            self.crop_size = (crop_size["height"], crop_size["width"])
+        if hasattr(crop_size, "height") and hasattr(crop_size, "width"):
+            self.crop_size = (int(crop_size.height), int(crop_size.width))
+        elif isinstance(crop_size, dict):
+            self.crop_size = (int(crop_size["height"]), int(crop_size["width"]))
+        elif isinstance(crop_size, (tuple, list)):
+            self.crop_size = (int(crop_size[0]), int(crop_size[1]))
         else:
             self.crop_size = (int(crop_size), int(crop_size))
 
         self.generator = torch.Generator(device=self.device).manual_seed(config.seed)
+        self.latent_generator = torch.Generator(
+            device=pipeline._execution_device
+        ).manual_seed(config.seed + 1)
         logger.info(
             "Loaded V-JEPA physics guide: model=%s, device=%s, scale=%g",
             config.model_id,
@@ -116,7 +126,55 @@ class VJEPAPhysicsGuidance:
 
     def _features(self, video: torch.Tensor) -> torch.Tensor:
         output = self.model(pixel_values_videos=video, skip_predictor=True)
-        return output.last_hidden_state
+        return output.last_hidden_state.float().mean(dim=1)
+
+    @torch.no_grad()
+    def _energy(self, latents: torch.Tensor, probes=None):
+        """Return per-sample JEPA Jacobian energy and reusable pixel probes."""
+        decoded = self.pipeline.decode_latents(latents)
+        video = self._preprocess(decoded)
+        del decoded
+
+        base_features = self._features(video)
+        if probes is None:
+            probes = []
+            for _ in range(self.config.energy_num_directions):
+                probe = torch.randn(
+                    video.shape,
+                    generator=self.generator,
+                    device=video.device,
+                    dtype=video.dtype,
+                )
+                probe_dims = tuple(range(1, probe.ndim))
+                probe_rms = (
+                    probe.float()
+                    .square()
+                    .mean(dim=probe_dims, keepdim=True)
+                    .sqrt()
+                    .clamp_min(1e-6)
+                )
+                probe = probe / probe_rms.to(probe.dtype)
+                probes.append(probe)
+        elif len(probes) != self.config.energy_num_directions:
+            raise ValueError(
+                f"Expected {self.config.energy_num_directions} probes, "
+                f"received {len(probes)}."
+            )
+
+        energies = []
+        for probe in probes:
+            perturbed_features = self._features(
+                video + self.config.energy_epsilon * probe
+            )
+            feature_jvp = (
+                perturbed_features - base_features
+            ) / self.config.energy_epsilon
+            energies.append(feature_jvp.square().mean(dim=1))
+            del perturbed_features, feature_jvp
+
+        energy = torch.stack(energies, dim=0).mean(dim=0)
+        del video, base_features, energies
+        return energy, probes
 
     def __call__(
         self, pipeline, step: int, timestep: torch.Tensor, callback_kwargs: Dict
@@ -125,43 +183,56 @@ class VJEPAPhysicsGuidance:
         if not self._should_apply(step):
             return callback_kwargs
 
-        with torch.enable_grad():
-            guided_latents = latents.detach().requires_grad_(True)
-            decoded = pipeline.decode_latents(guided_latents)
-            video = self._preprocess(decoded)
-
+        with torch.no_grad():
             direction = torch.randn(
-                video.shape,
-                generator=self.generator,
-                device=video.device,
-                dtype=video.dtype,
+                latents.shape,
+                generator=self.latent_generator,
+                device=latents.device,
+                dtype=latents.dtype,
             )
-            direction = direction / direction.square().mean().sqrt().clamp_min(1e-6)
-            perturbed = video + self.config.fd_epsilon * direction
-
-            features = self._features(video)
-            perturbed_features = self._features(perturbed)
-            energy = (
-                (perturbed_features - features).float().square().mean()
-                / self.config.fd_epsilon**2
+            latent_dims = tuple(range(1, direction.ndim))
+            direction_rms = (
+                direction.float()
+                .square()
+                .mean(dim=latent_dims, keepdim=True)
+                .sqrt()
+                .clamp_min(1e-6)
             )
-            gradient = torch.autograd.grad(energy, guided_latents)[0]
+            direction = direction / direction_rms.to(direction.dtype)
 
-        # RMS normalization makes the scale interpretable across timesteps.
-        dims = tuple(range(1, gradient.ndim))
-        gradient_rms = gradient.float().square().mean(dim=dims, keepdim=True).sqrt()
-        normalized_gradient = gradient / gradient_rms.to(gradient.dtype).clamp_min(1e-6)
-        latent_scale = latents.float().std(dim=dims, keepdim=True).to(latents.dtype)
-        callback_kwargs["latents"] = (
-            latents - self.config.scale * latent_scale * normalized_gradient
-        ).detach()
+            base_energy, energy_probes = self._energy(latents)
+            perturbed_latents = (
+                latents + self.config.latent_epsilon * direction
+            )
+            perturbed_energy, _ = self._energy(
+                perturbed_latents, probes=energy_probes
+            )
+
+            derivative = (
+                perturbed_energy - base_energy
+            ) / self.config.latent_epsilon
+            objective_derivative = -derivative if self.config.maximize else derivative
+            projected_gradient = objective_derivative.view(
+                -1, *([1] * (direction.ndim - 1))
+            ).to(device=direction.device, dtype=direction.dtype) * direction
+            update = self.config.scale * projected_gradient
+            callback_kwargs["latents"] = (latents - update).detach()
+
+            update_rms = update.float().square().mean().sqrt()
+            latent_rms = latents.float().square().mean().sqrt()
+            relative_update = update_rms / latent_rms.clamp_min(1e-8)
 
         logger.info(
-            "Physics guide step=%d timestep=%s energy=%.6g grad_rms=%.6g",
+            "Physics guide step=%d timestep=%s energy=%.6g "
+            "perturbed_energy=%.6g derivative=%.6g update_rms=%.6g "
+            "relative_update=%.6g mode=%s",
             step,
             timestep.item(),
-            energy.item(),
-            gradient_rms.mean().item(),
+            base_energy.mean().item(),
+            perturbed_energy.mean().item(),
+            derivative.mean().item(),
+            update_rms.item(),
+            relative_update.item(),
+            "maximize" if self.config.maximize else "minimize",
         )
         return callback_kwargs
-
