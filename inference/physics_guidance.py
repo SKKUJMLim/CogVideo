@@ -1,9 +1,9 @@
-"""Memory-efficient V-JEPA 2 guidance for CogVideoX inference.
+"""TITAN-style, backpropagation-free V-JEPA 2 guidance for CogVideoX.
 
-The guide estimates V-JEPA Jacobian energy in pixel space, then estimates its
-gradient in latent space using central directional finite differences. All VAE
-and V-JEPA evaluations run without autograd so the callback does not retain a
-full video-backpropagation graph.
+At a selected denoising step, each perturbed current latent is rolled out over
+all remaining timesteps. V-JEPA energy is evaluated on the predicted final
+video, and central directional finite differences estimate a correction for
+the current latent. No video-generation computation graph is retained.
 """
 
 import logging
@@ -30,13 +30,14 @@ class PhysicsGuidanceConfig:
     energy_num_directions: int = 1
     latent_epsilon: float = 0.05
     latent_num_directions: int = 4
+    rollout_to_final: bool = True
     maximize: bool = False
     seed: int = 0
     device: str = "auto"
 
 
 class VJEPAPhysicsGuidance:
-    """Correct CogVideoX latents using V-JEPA feature sensitivity."""
+    """Correct the current CogVideoX latent using predicted final-video energy."""
 
     def __init__(self, pipeline, config: PhysicsGuidanceConfig):
         self.pipeline = pipeline
@@ -132,9 +133,9 @@ class VJEPAPhysicsGuidance:
         return output.last_hidden_state.float().mean(dim=1)
 
     @torch.no_grad()
-    def _energy(self, latents: torch.Tensor, probes=None):
-        """Return per-sample JEPA Jacobian energy and reusable pixel probes."""
-        decoded = self.pipeline.decode_latents(latents)
+    def _video_energy(self, final_latents: torch.Tensor, probes=None):
+        """Return per-sample JEPA energy for a predicted final video."""
+        decoded = self.pipeline.decode_latents(final_latents)
         video = self._preprocess(decoded)
         del decoded
 
@@ -179,20 +180,116 @@ class VJEPAPhysicsGuidance:
         del video, base_features, energies
         return energy, probes
 
+    @torch.no_grad()
+    def _rollout_to_final(
+        self,
+        latents: torch.Tensor,
+        step: int,
+        prompt_embeds: torch.Tensor,
+        negative_prompt_embeds: torch.Tensor,
+    ) -> torch.Tensor:
+        """Denoise ``latents`` over the timesteps remaining after ``step``.
+
+        A fresh scheduler is used so the temporary rollout cannot alter the
+        scheduler state of the main generation path. CogVideoX's callback runs
+        after the scheduler step, hence ``latents`` is the main path's current
+        z_(t-1), and rollout starts at the following scheduler timestep.
+        """
+        original_scheduler = self.pipeline.scheduler
+        remaining = original_scheduler.timesteps[step + 1 :]
+        if len(remaining) == 0:
+            return latents
+
+        scheduler_cls = type(original_scheduler)
+        rollout_scheduler = scheduler_cls.from_config(original_scheduler.config)
+
+        # The callback receives the concatenated [negative, positive] embeddings
+        # when classifier-free guidance is active. A nested pipeline call expects
+        # the two parts separately and performs the concatenation itself.
+        guidance_scale = float(self.pipeline.guidance_scale)
+        if guidance_scale > 1.0:
+            negative_batch = negative_prompt_embeds.shape[0]
+            positive_prompt_embeds = prompt_embeds[negative_batch:]
+        else:
+            positive_prompt_embeds = prompt_embeds
+
+        height = latents.shape[-2] * self.pipeline.vae_scale_factor_spatial
+        width = latents.shape[-1] * self.pipeline.vae_scale_factor_spatial
+        num_frames = (
+            (latents.shape[1] - 1) * self.pipeline.vae_scale_factor_temporal + 1
+        )
+        remaining_timesteps = [int(value) for value in remaining.detach().cpu()]
+
+        pipeline_state = {
+            name: getattr(self.pipeline, name, None)
+            for name in (
+                "_guidance_scale",
+                "_attention_kwargs",
+                "_current_timestep",
+                "_interrupt",
+                "_num_timesteps",
+            )
+        }
+        try:
+            self.pipeline.scheduler = rollout_scheduler
+            output = self.pipeline(
+                prompt=None,
+                negative_prompt=None,
+                height=height,
+                width=width,
+                num_frames=num_frames,
+                guidance_scale=guidance_scale,
+                prompt_embeds=positive_prompt_embeds,
+                negative_prompt_embeds=negative_prompt_embeds,
+                latents=latents.clone(),
+                timesteps=remaining_timesteps,
+                output_type="latent",
+                return_dict=True,
+            )
+            return output.frames.detach()
+        finally:
+            self.pipeline.scheduler = original_scheduler
+            for name, value in pipeline_state.items():
+                setattr(self.pipeline, name, value)
+
+    @torch.no_grad()
+    def _objective(
+        self,
+        latents: torch.Tensor,
+        step: int,
+        prompt_embeds: torch.Tensor,
+        negative_prompt_embeds: torch.Tensor,
+        probes=None,
+    ):
+        if self.config.rollout_to_final:
+            final_latents = self._rollout_to_final(
+                latents,
+                step,
+                prompt_embeds,
+                negative_prompt_embeds,
+            )
+        else:
+            final_latents = latents
+        energy, probes = self._video_energy(final_latents, probes=probes)
+        del final_latents
+        return energy, probes
+
     def __call__(
         self, pipeline, step: int, timestep: torch.Tensor, callback_kwargs: Dict
     ) -> Dict:
         latents = callback_kwargs["latents"]
         if not self._should_apply(step):
             return callback_kwargs
+        prompt_embeds = callback_kwargs["prompt_embeds"]
+        negative_prompt_embeds = callback_kwargs["negative_prompt_embeds"]
 
         with torch.no_grad():
-            base_energy, energy_probes = self._energy(latents)
             latent_dims = tuple(range(1, latents.ndim))
             gradient_estimate = torch.zeros_like(latents)
             derivatives = []
             positive_energies = []
             negative_energies = []
+            energy_probes = None
 
             for _ in range(self.config.latent_num_directions):
                 direction = torch.randn(
@@ -210,12 +307,18 @@ class VJEPAPhysicsGuidance:
                 )
                 direction = direction / direction_rms.to(direction.dtype)
 
-                positive_energy, _ = self._energy(
+                positive_energy, energy_probes = self._objective(
                     latents + self.config.latent_epsilon * direction,
+                    step,
+                    prompt_embeds,
+                    negative_prompt_embeds,
                     probes=energy_probes,
                 )
-                negative_energy, _ = self._energy(
+                negative_energy, _ = self._objective(
                     latents - self.config.latent_epsilon * direction,
+                    step,
+                    prompt_embeds,
+                    negative_prompt_embeds,
                     probes=energy_probes,
                 )
                 derivative = (
@@ -274,14 +377,13 @@ class VJEPAPhysicsGuidance:
             relative_update = update_rms / latent_rms.clamp_min(1e-8)
 
         logger.info(
-            "Physics guide step=%d timestep=%s energy=%.6g "
+            "Physics guide step=%d timestep=%s "
             "positive_energy=%.6g negative_energy=%.6g "
             "derivative_mean=%.6g derivative_abs_mean=%.6g "
             "gradient_rms=%.6g update_rms=%.6g relative_update=%.6g "
-            "latent_directions=%d mode=%s",
+            "latent_directions=%d objective=%s mode=%s",
             step,
             timestep.item(),
-            base_energy.mean().item(),
             positive_energy_mean.item(),
             negative_energy_mean.item(),
             derivative_values.mean().item(),
@@ -290,6 +392,7 @@ class VJEPAPhysicsGuidance:
             update_rms.item(),
             relative_update.item(),
             self.config.latent_num_directions,
+            "final_rollout" if self.config.rollout_to_final else "current_decode",
             "maximize" if self.config.maximize else "minimize",
         )
         return callback_kwargs

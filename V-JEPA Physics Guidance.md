@@ -1,57 +1,81 @@
-# V-JEPA Physics Guidance
+# TITAN-style V-JEPA physics guidance
 
-This experimental guide corrects CogVideoX latents during denoising by
-minimizing a finite-difference approximation of V-JEPA 2 feature sensitivity.
-It does not add a text description of the expected physical outcome.
+The default physics objective now evaluates a predicted final video instead of
+decoding the current noisy latent directly.
 
-## Baseline
+At a selected callback step, CogVideoX has already produced the current
+`z_(t-1)`. For every sampled latent direction `v`, the guide computes
 
-Keep `--physics_guidance_scale 0` (the default). The original CogVideoX
-pipeline is unchanged.
-
-## Guided generation
-
-Start with a small correction strength and only three guide evaluations:
-
-```bat
-python inference/cli_demo.py ^
-  --prompt "A small fire burns on a compact pile of wooden logs in an outdoor fire pit. From the side of the frame, a person quickly swings a bucket and throws a large amount of clear water directly onto the flames in one sudden motion. The water forms a wide, forceful splash that covers the fire and the wooden logs. The camera remains stationary, keeping the fire pit and the splash of water clearly visible throughout the scene." ^
-  --model_path zai-org/CogVideoX-2b ^
-  --generate_type t2v ^
-  --output_path outputs/fire_water_guided.mp4 ^
-  --num_inference_steps 50 ^
-  --num_frames 49 ^
-  --guidance_scale 6.0 ^
-  --seed 42 ^
-  --dtype float16 ^
-  --fps 8 ^
-  --physics_guidance_scale 0.01 ^
-  --physics_guidance_start_step 20 ^
-  --physics_guidance_end_step 40 ^
-  --physics_guidance_interval 10 ^
-  --physics_guidance_frames 16 ^
-  --physics_guidance_epsilon 0.01
+```text
+z_plus  = z_(t-1) + epsilon * v
+z_minus = z_(t-1) - epsilon * v
 ```
 
-This applies corrections at zero-based denoising steps 20, 30, and 40.
-Compare against a baseline made with the same prompt, seed, scheduler, and
-generation settings.
+Both branches are independently denoised over all remaining timesteps. The
+resulting final videos are evaluated with the same V-JEPA pixel probes:
 
-The first run also downloads
-`facebook/vjepa2-vitl-fpc64-256`. V-JEPA backpropagation and VAE decoding make
-guided generation substantially slower and more memory intensive than the
-baseline.
+```text
+dE/dv ~= (E(final(z_plus)) - E(final(z_minus))) / (2 * epsilon)
+```
 
-## Main options
+The directional estimates are averaged and applied to the main-path
+`z_(t-1)`. Temporary rollout latents are discarded. The main scheduler is never
+used by a temporary rollout; every branch receives a fresh scheduler instance.
 
-- `--physics_guidance_scale`: normalized latent correction strength. Try
-  `0.005`, `0.01`, then `0.02`.
-- `--physics_guidance_interval`: number of denoising steps between guide
-  evaluations.
-- `--physics_guidance_start_step`, `--physics_guidance_end_step`: inclusive
-  step range.
-- `--physics_guidance_frames`: uniformly sampled decoded frames passed to
-  V-JEPA.
-- `--physics_guidance_epsilon`: pixel-space finite-difference magnitude.
-- `--physics_guidance_device`: `auto`, `cuda`, or `cpu`.
+This is a TITAN-style final-rollout objective implemented with central finite
+differences. It does not yet use TITAN-Guide's forward-mode AD/JVP, so one
+latent direction requires two remaining-step rollouts.
 
+## Minimal first test
+
+Use one guidance step and one latent direction first:
+
+```bash
+python inference/cli_demo.py \
+  --prompt "A person throws a large amount of water directly toward a burning pile of wooden logs." \
+  --model_path THUDM/CogVideoX-2b \
+  --generate_type t2v \
+  --output_path outputs/titan_physics_guidance.mp4 \
+  --num_inference_steps 50 \
+  --num_frames 49 \
+  --guidance_scale 6.0 \
+  --seed 42 \
+  --dtype float16 \
+  --fps 8 \
+  --physics_guidance_scale 0.01 \
+  --physics_guidance_start_step 20 \
+  --physics_guidance_end_step 20 \
+  --physics_guidance_interval 1 \
+  --physics_guidance_latent_epsilon 0.05 \
+  --physics_guidance_latent_directions 1 \
+  --physics_guidance_directions 1 \
+  --physics_guidance_device cuda
+```
+
+With 50 denoising steps, guidance after step 20 rolls each branch through the
+remaining 29 steps. One latent direction therefore performs 58 additional
+transformer steps, plus two final VAE decodes and V-JEPA energy evaluations.
+
+The log should contain:
+
+```text
+objective=final_rollout
+positive_energy=...
+negative_energy=...
+derivative_abs_mean=...
+relative_update=...
+```
+
+To reproduce the old current-latent decode as an ablation, add:
+
+```text
+--physics_guidance_current_decode
+```
+
+## Current approximation
+
+The main generation uses dynamic classifier-free guidance. A temporary rollout
+freezes classifier-free guidance at the value active at the branching step.
+This avoids restarting the dynamic schedule with an incorrect shortened-step
+index. The plus and minus branches use the same frozen value, so their energy
+difference remains paired.
