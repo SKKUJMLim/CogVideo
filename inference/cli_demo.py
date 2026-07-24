@@ -76,6 +76,7 @@ def generate_video(
     physics_guidance_epsilon: float = 0.01,
     physics_guidance_directions: int = 1,
     physics_guidance_latent_epsilon: float = 0.05,
+    physics_guidance_latent_directions: int = 4,
     physics_guidance_maximize: bool = False,
     physics_guidance_device: str = "auto",
 ):
@@ -179,6 +180,7 @@ def generate_video(
                 energy_epsilon=physics_guidance_epsilon,
                 energy_num_directions=physics_guidance_directions,
                 latent_epsilon=physics_guidance_latent_epsilon,
+                latent_num_directions=physics_guidance_latent_directions,
                 maximize=physics_guidance_maximize,
                 seed=seed,
                 device=physics_guidance_device,
@@ -306,6 +308,9 @@ if __name__ == "__main__":
         "--physics_guidance_latent_epsilon", type=float, default=0.05
     )
     parser.add_argument(
+        "--physics_guidance_latent_directions", type=int, default=4
+    )
+    parser.add_argument(
         "--physics_guidance_maximize",
         action="store_true",
         help="Maximize JEPA energy. The default minimizes it.",
@@ -345,6 +350,7 @@ if __name__ == "__main__":
         physics_guidance_epsilon=args.physics_guidance_epsilon,
         physics_guidance_directions=args.physics_guidance_directions,
         physics_guidance_latent_epsilon=args.physics_guidance_latent_epsilon,
+        physics_guidance_latent_directions=args.physics_guidance_latent_directions,
         physics_guidance_maximize=args.physics_guidance_maximize,
         physics_guidance_device=args.physics_guidance_device,
     )

@@ -1,9 +1,9 @@
 """Memory-efficient V-JEPA 2 guidance for CogVideoX inference.
 
 The guide estimates V-JEPA Jacobian energy in pixel space, then estimates its
-directional derivative in latent space using forward finite differences.  All
-VAE and V-JEPA evaluations run without autograd so the callback does not retain
-a full video-backpropagation graph.
+gradient in latent space using central directional finite differences. All VAE
+and V-JEPA evaluations run without autograd so the callback does not retain a
+full video-backpropagation graph.
 """
 
 import logging
@@ -29,6 +29,7 @@ class PhysicsGuidanceConfig:
     energy_epsilon: float = 0.01
     energy_num_directions: int = 1
     latent_epsilon: float = 0.05
+    latent_num_directions: int = 4
     maximize: bool = False
     seed: int = 0
     device: str = "auto"
@@ -51,6 +52,8 @@ class VJEPAPhysicsGuidance:
             raise ValueError("Energy directions must be at least one.")
         if config.latent_epsilon <= 0:
             raise ValueError("Latent finite-difference epsilon must be greater than zero.")
+        if config.latent_num_directions < 1:
+            raise ValueError("Latent directions must be at least one.")
 
         if config.device == "auto":
             self.device = pipeline._execution_device
@@ -184,55 +187,109 @@ class VJEPAPhysicsGuidance:
             return callback_kwargs
 
         with torch.no_grad():
-            direction = torch.randn(
-                latents.shape,
-                generator=self.latent_generator,
-                device=latents.device,
-                dtype=latents.dtype,
-            )
-            latent_dims = tuple(range(1, direction.ndim))
-            direction_rms = (
-                direction.float()
+            base_energy, energy_probes = self._energy(latents)
+            latent_dims = tuple(range(1, latents.ndim))
+            gradient_estimate = torch.zeros_like(latents)
+            derivatives = []
+            positive_energies = []
+            negative_energies = []
+
+            for _ in range(self.config.latent_num_directions):
+                direction = torch.randn(
+                    latents.shape,
+                    generator=self.latent_generator,
+                    device=latents.device,
+                    dtype=latents.dtype,
+                )
+                direction_rms = (
+                    direction.float()
+                    .square()
+                    .mean(dim=latent_dims, keepdim=True)
+                    .sqrt()
+                    .clamp_min(1e-6)
+                )
+                direction = direction / direction_rms.to(direction.dtype)
+
+                positive_energy, _ = self._energy(
+                    latents + self.config.latent_epsilon * direction,
+                    probes=energy_probes,
+                )
+                negative_energy, _ = self._energy(
+                    latents - self.config.latent_epsilon * direction,
+                    probes=energy_probes,
+                )
+                derivative = (
+                    positive_energy - negative_energy
+                ) / (2 * self.config.latent_epsilon)
+                objective_derivative = (
+                    -derivative if self.config.maximize else derivative
+                )
+                gradient_estimate.add_(
+                    objective_derivative.view(
+                        -1, *([1] * (latents.ndim - 1))
+                    ).to(device=direction.device, dtype=direction.dtype)
+                    * direction
+                )
+                derivatives.append(derivative)
+                positive_energies.append(positive_energy)
+                negative_energies.append(negative_energy)
+
+            gradient_estimate.div_(self.config.latent_num_directions)
+            gradient_rms = (
+                gradient_estimate.float()
                 .square()
                 .mean(dim=latent_dims, keepdim=True)
                 .sqrt()
-                .clamp_min(1e-6)
             )
-            direction = direction / direction_rms.to(direction.dtype)
-
-            base_energy, energy_probes = self._energy(latents)
-            perturbed_latents = (
-                latents + self.config.latent_epsilon * direction
-            )
-            perturbed_energy, _ = self._energy(
-                perturbed_latents, probes=energy_probes
+            valid_gradient = gradient_rms > 1e-12
+            normalized_gradient = gradient_estimate / gradient_rms.clamp_min(
+                1e-8
+            ).to(gradient_estimate.dtype)
+            normalized_gradient = normalized_gradient * valid_gradient.to(
+                normalized_gradient.dtype
             )
 
-            derivative = (
-                perturbed_energy - base_energy
-            ) / self.config.latent_epsilon
-            objective_derivative = -derivative if self.config.maximize else derivative
-            projected_gradient = objective_derivative.view(
-                -1, *([1] * (direction.ndim - 1))
-            ).to(device=direction.device, dtype=direction.dtype) * direction
-            update = self.config.scale * projected_gradient
+            latent_rms_per_sample = (
+                latents.float()
+                .square()
+                .mean(dim=latent_dims, keepdim=True)
+                .sqrt()
+            )
+            update = (
+                self.config.scale
+                * latent_rms_per_sample.to(normalized_gradient.dtype)
+                * normalized_gradient
+            )
             callback_kwargs["latents"] = (latents - update).detach()
 
+            derivative_values = torch.stack(derivatives, dim=0)
+            positive_energy_mean = torch.stack(
+                positive_energies, dim=0
+            ).mean()
+            negative_energy_mean = torch.stack(
+                negative_energies, dim=0
+            ).mean()
             update_rms = update.float().square().mean().sqrt()
             latent_rms = latents.float().square().mean().sqrt()
             relative_update = update_rms / latent_rms.clamp_min(1e-8)
 
         logger.info(
             "Physics guide step=%d timestep=%s energy=%.6g "
-            "perturbed_energy=%.6g derivative=%.6g update_rms=%.6g "
-            "relative_update=%.6g mode=%s",
+            "positive_energy=%.6g negative_energy=%.6g "
+            "derivative_mean=%.6g derivative_abs_mean=%.6g "
+            "gradient_rms=%.6g update_rms=%.6g relative_update=%.6g "
+            "latent_directions=%d mode=%s",
             step,
             timestep.item(),
             base_energy.mean().item(),
-            perturbed_energy.mean().item(),
-            derivative.mean().item(),
+            positive_energy_mean.item(),
+            negative_energy_mean.item(),
+            derivative_values.mean().item(),
+            derivative_values.abs().mean().item(),
+            gradient_rms.mean().item(),
             update_rms.item(),
             relative_update.item(),
+            self.config.latent_num_directions,
             "maximize" if self.config.maximize else "minimize",
         )
         return callback_kwargs
