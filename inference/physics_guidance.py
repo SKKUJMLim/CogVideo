@@ -456,12 +456,15 @@ class VJEPAPhysicsGuidance:
             # Rank-1 projected gradient:
             # grad(E) ≈ D_V E * V
             projected_gradient = (
-                objective_derivative.view(
-                    -1,
-                    *([1] * (direction.ndim - 1)),
-                )
-                .to(direction.dtype)
-                * direction
+                    objective_derivative.view(
+                        -1,
+                        *([1] * (direction.ndim - 1)),
+                    )
+                    .to(
+                        device=direction.device,
+                        dtype=direction.dtype,
+                    )
+                    * direction
             )
 
             update = (
