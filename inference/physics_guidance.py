@@ -7,6 +7,8 @@ the current latent. No video-generation computation graph is retained.
 """
 
 import logging
+import math
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Dict
 
@@ -29,7 +31,7 @@ class PhysicsGuidanceConfig:
     energy_epsilon: float = 0.01
     energy_num_directions: int = 1
     latent_epsilon: float = 0.05
-    latent_num_directions: int = 4
+    latent_num_directions: int = 1
     rollout_to_final: bool = True
     maximize: bool = False
     seed: int = 0
@@ -195,62 +197,134 @@ class VJEPAPhysicsGuidance:
         after the scheduler step, hence ``latents`` is the main path's current
         z_(t-1), and rollout starts at the following scheduler timestep.
         """
+        del negative_prompt_embeds  # prompt_embeds is already [negative, positive] under CFG.
+
         original_scheduler = self.pipeline.scheduler
-        remaining = original_scheduler.timesteps[step + 1 :]
-        if len(remaining) == 0:
+        total_steps = len(original_scheduler.timesteps)
+        if step + 1 >= total_steps:
             return latents
 
         scheduler_cls = type(original_scheduler)
         rollout_scheduler = scheduler_cls.from_config(original_scheduler.config)
-
-        # The callback receives the concatenated [negative, positive] embeddings
-        # when classifier-free guidance is active. A nested pipeline call expects
-        # the two parts separately and performs the concatenation itself.
-        guidance_scale = float(self.pipeline.guidance_scale)
-        if guidance_scale > 1.0:
-            negative_batch = negative_prompt_embeds.shape[0]
-            positive_prompt_embeds = prompt_embeds[negative_batch:]
-        else:
-            positive_prompt_embeds = prompt_embeds
-
+        rollout_scheduler.set_timesteps(
+            total_steps, device=latents.device
+        )
+        remaining = rollout_scheduler.timesteps[step + 1 :]
         height = latents.shape[-2] * self.pipeline.vae_scale_factor_spatial
         width = latents.shape[-1] * self.pipeline.vae_scale_factor_spatial
-        num_frames = (
-            (latents.shape[1] - 1) * self.pipeline.vae_scale_factor_temporal + 1
+        image_rotary_emb = (
+            self.pipeline._prepare_rotary_positional_embeddings(
+                height,
+                width,
+                latents.size(1),
+                latents.device,
+            )
+            if self.pipeline.transformer.config.use_rotary_positional_embeddings
+            else None
         )
-        remaining_timesteps = [int(value) for value in remaining.detach().cpu()]
+        ofs_emb = (
+            None
+            if self.pipeline.transformer.config.ofs_embed_dim is None
+            else latents.new_full((1,), fill_value=2.0)
+        )
+        attention_kwargs = getattr(self.pipeline, "_attention_kwargs", None)
+        do_cfg = prompt_embeds.shape[0] == 2 * latents.shape[0]
+        extra_step_kwargs = self.pipeline.prepare_extra_step_kwargs(
+            generator=None, eta=0.0
+        )
 
-        pipeline_state = {
-            name: getattr(self.pipeline, name, None)
-            for name in (
-                "_guidance_scale",
-                "_attention_kwargs",
-                "_current_timestep",
-                "_interrupt",
-                "_num_timesteps",
+        # cli_demo.py enables dynamic CFG. Recover its original CLI scale from
+        # the scale at the callback step, then reproduce the same future scale.
+        current_scale = float(self.pipeline.guidance_scale)
+        current_timestep = float(original_scheduler.timesteps[step].item())
+        dynamic_factor = (
+            1
+            - math.cos(
+                math.pi
+                * ((total_steps - current_timestep) / total_steps) ** 5.0
             )
-        }
-        try:
-            self.pipeline.scheduler = rollout_scheduler
-            output = self.pipeline(
-                prompt=None,
-                negative_prompt=None,
-                height=height,
-                width=width,
-                num_frames=num_frames,
-                guidance_scale=guidance_scale,
-                prompt_embeds=positive_prompt_embeds,
-                negative_prompt_embeds=negative_prompt_embeds,
-                latents=latents.clone(),
-                timesteps=remaining_timesteps,
-                output_type="latent",
-                return_dict=True,
+        ) / 2
+        base_guidance_scale = (
+            (current_scale - 1) / dynamic_factor
+            if do_cfg and dynamic_factor > 1e-8
+            else current_scale
+        )
+
+        rollout_latents = latents.clone()
+        old_pred_original_sample = None
+        is_dpm = scheduler_cls.__name__ == "CogVideoXDPMScheduler"
+
+        for rollout_index, rollout_timestep in enumerate(remaining):
+            latent_model_input = (
+                torch.cat([rollout_latents] * 2)
+                if do_cfg
+                else rollout_latents
             )
-            return output.frames.detach()
-        finally:
-            self.pipeline.scheduler = original_scheduler
-            for name, value in pipeline_state.items():
-                setattr(self.pipeline, name, value)
+            latent_model_input = rollout_scheduler.scale_model_input(
+                latent_model_input, rollout_timestep
+            )
+            timestep_batch = rollout_timestep.expand(
+                latent_model_input.shape[0]
+            )
+
+            cache_context = (
+                self.pipeline.transformer.cache_context("cond_uncond")
+                if hasattr(self.pipeline.transformer, "cache_context")
+                else nullcontext()
+            )
+            with cache_context:
+                noise_pred = self.pipeline.transformer(
+                    hidden_states=latent_model_input,
+                    encoder_hidden_states=prompt_embeds,
+                    timestep=timestep_batch,
+                    ofs=ofs_emb,
+                    image_rotary_emb=image_rotary_emb,
+                    attention_kwargs=attention_kwargs,
+                    return_dict=False,
+                )[0].float()
+
+            if do_cfg:
+                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                t_value = float(rollout_timestep.item())
+                guidance_scale = 1 + base_guidance_scale * (
+                    1
+                    - math.cos(
+                        math.pi
+                        * ((total_steps - t_value) / total_steps) ** 5.0
+                    )
+                ) / 2
+                noise_pred = noise_pred_uncond + guidance_scale * (
+                    noise_pred_text - noise_pred_uncond
+                )
+
+            if is_dpm:
+                previous_timestep = (
+                    rollout_scheduler.timesteps[step]
+                    if rollout_index == 0
+                    else remaining[rollout_index - 1]
+                )
+                rollout_latents, old_pred_original_sample = (
+                    rollout_scheduler.step(
+                        noise_pred,
+                        old_pred_original_sample,
+                        rollout_timestep,
+                        previous_timestep,
+                        rollout_latents,
+                        **extra_step_kwargs,
+                        return_dict=False,
+                    )
+                )
+            else:
+                rollout_latents = rollout_scheduler.step(
+                    noise_pred,
+                    rollout_timestep,
+                    rollout_latents,
+                    **extra_step_kwargs,
+                    return_dict=False,
+                )[0]
+            rollout_latents = rollout_latents.to(prompt_embeds.dtype)
+
+        return rollout_latents.detach()
 
     @torch.no_grad()
     def _objective(
@@ -285,95 +359,157 @@ class VJEPAPhysicsGuidance:
 
         with torch.no_grad():
             latent_dims = tuple(range(1, latents.ndim))
-            gradient_estimate = torch.zeros_like(latents)
+            # Finite-difference derivatives can be much larger than the FP16
+            # range. Keep the complete guidance calculation in FP32 and cast
+            # only the final, validated latent back to the pipeline dtype.
+            latents_fp32 = latents.float()
+            gradient_estimate = torch.zeros_like(
+                latents, dtype=torch.float32
+            )
             derivatives = []
             positive_energies = []
             negative_energies = []
             energy_probes = None
+            guidance_valid = True
+            skip_reason = ""
 
             for _ in range(self.config.latent_num_directions):
-                direction = torch.randn(
+                direction_fp32 = torch.randn(
                     latents.shape,
                     generator=self.latent_generator,
                     device=latents.device,
-                    dtype=latents.dtype,
+                    dtype=torch.float32,
                 )
                 direction_rms = (
-                    direction.float()
+                    direction_fp32
                     .square()
                     .mean(dim=latent_dims, keepdim=True)
                     .sqrt()
                     .clamp_min(1e-6)
                 )
-                direction = direction / direction_rms.to(direction.dtype)
+                direction_fp32 = direction_fp32 / direction_rms
+
+                # The CogVideoX rollout still runs in the pipeline dtype, but
+                # form each perturbation in FP32 before the final cast.
+                positive_latents = (
+                    latents_fp32
+                    + self.config.latent_epsilon * direction_fp32
+                ).to(latents.dtype)
+                negative_latents = (
+                    latents_fp32
+                    - self.config.latent_epsilon * direction_fp32
+                ).to(latents.dtype)
 
                 positive_energy, energy_probes = self._objective(
-                    latents + self.config.latent_epsilon * direction,
+                    positive_latents,
                     step,
                     prompt_embeds,
                     negative_prompt_embeds,
                     probes=energy_probes,
                 )
                 negative_energy, _ = self._objective(
-                    latents - self.config.latent_epsilon * direction,
+                    negative_latents,
                     step,
                     prompt_embeds,
                     negative_prompt_embeds,
                     probes=energy_probes,
                 )
+                del positive_latents, negative_latents
+
+                if not (
+                    torch.isfinite(positive_energy).all()
+                    and torch.isfinite(negative_energy).all()
+                ):
+                    guidance_valid = False
+                    skip_reason = "non_finite_energy"
+                    break
+
                 derivative = (
-                    positive_energy - negative_energy
+                    positive_energy.float() - negative_energy.float()
                 ) / (2 * self.config.latent_epsilon)
+                if not torch.isfinite(derivative).all():
+                    guidance_valid = False
+                    skip_reason = "non_finite_derivative"
+                    break
+
                 objective_derivative = (
                     -derivative if self.config.maximize else derivative
                 )
                 gradient_estimate.add_(
                     objective_derivative.view(
                         -1, *([1] * (latents.ndim - 1))
-                    ).to(device=direction.device, dtype=direction.dtype)
-                    * direction
+                    )
+                    * direction_fp32
                 )
                 derivatives.append(derivative)
                 positive_energies.append(positive_energy)
                 negative_energies.append(negative_energy)
 
-            gradient_estimate.div_(self.config.latent_num_directions)
-            gradient_rms = (
-                gradient_estimate.float()
-                .square()
-                .mean(dim=latent_dims, keepdim=True)
-                .sqrt()
-            )
-            valid_gradient = gradient_rms > 1e-12
-            normalized_gradient = gradient_estimate / gradient_rms.clamp_min(
-                1e-8
-            ).to(gradient_estimate.dtype)
-            normalized_gradient = normalized_gradient * valid_gradient.to(
-                normalized_gradient.dtype
-            )
+            if guidance_valid:
+                gradient_estimate.div_(self.config.latent_num_directions)
+                gradient_rms = (
+                    gradient_estimate.square()
+                    .mean(dim=latent_dims, keepdim=True)
+                    .sqrt()
+                )
+                if not torch.isfinite(gradient_rms).all():
+                    guidance_valid = False
+                    skip_reason = "non_finite_gradient_rms"
+                elif not (gradient_rms > 1e-12).all():
+                    guidance_valid = False
+                    skip_reason = "zero_gradient"
 
-            latent_rms_per_sample = (
-                latents.float()
-                .square()
-                .mean(dim=latent_dims, keepdim=True)
-                .sqrt()
-            )
-            update = (
-                self.config.scale
-                * latent_rms_per_sample.to(normalized_gradient.dtype)
-                * normalized_gradient
-            )
-            callback_kwargs["latents"] = (latents - update).detach()
+            if guidance_valid:
+                normalized_gradient = (
+                    gradient_estimate / gradient_rms.clamp_min(1e-8)
+                )
+                latent_rms_per_sample = (
+                    latents_fp32.square()
+                    .mean(dim=latent_dims, keepdim=True)
+                    .sqrt()
+                )
+                update_fp32 = (
+                    self.config.scale
+                    * latent_rms_per_sample
+                    * normalized_gradient
+                )
+                guided_latents_fp32 = latents_fp32 - update_fp32
+
+                if not (
+                    torch.isfinite(update_fp32).all()
+                    and torch.isfinite(guided_latents_fp32).all()
+                ):
+                    guidance_valid = False
+                    skip_reason = "non_finite_update"
+
+            if guidance_valid:
+                guided_latents = guided_latents_fp32.to(latents.dtype)
+                if torch.isfinite(guided_latents).all():
+                    callback_kwargs["latents"] = guided_latents.detach()
+                else:
+                    guidance_valid = False
+                    skip_reason = "cast_overflow"
+
+            # A failed guidance evaluation must never contaminate the main
+            # denoising trajectory. Leave callback_kwargs["latents"] unchanged.
+            if not guidance_valid:
+                logger.warning(
+                    "Skipping physics guide step=%d timestep=%s reason=%s",
+                    step,
+                    timestep.item(),
+                    skip_reason,
+                )
+                return callback_kwargs
 
             derivative_values = torch.stack(derivatives, dim=0)
             positive_energy_mean = torch.stack(
                 positive_energies, dim=0
-            ).mean()
+            ).float().mean()
             negative_energy_mean = torch.stack(
                 negative_energies, dim=0
-            ).mean()
-            update_rms = update.float().square().mean().sqrt()
-            latent_rms = latents.float().square().mean().sqrt()
+            ).float().mean()
+            update_rms = update_fp32.square().mean().sqrt()
+            latent_rms = latents_fp32.square().mean().sqrt()
             relative_update = update_rms / latent_rms.clamp_min(1e-8)
 
         logger.info(
