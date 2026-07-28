@@ -1,8 +1,8 @@
 import cv2
 import numpy as np
 
-baseline = cv2.VideoCapture("outputs/honey_milk_baseline.mp4")
-guided = cv2.VideoCapture("outputs/fire_water.mp4")
+baseline = cv2.VideoCapture("outputs/honey_milk_5b_baseline.mp4")
+guided = cv2.VideoCapture("outputs/titan_test.mp4")
 
 differences = []
 
@@ -19,3 +19,6 @@ while True:
 print("Compared frames:", len(differences))
 print("Mean pixel difference:", np.mean(differences))
 print("Maximum frame difference:", np.max(differences))
+
+
+# python inference/video_compare.py
