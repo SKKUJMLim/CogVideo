@@ -2,7 +2,7 @@
 ## 전체 생성
 python inference/batch_generate_videophy.py 
  --prompts_path outputs/videophy_detailed.txt 
- --output_root outputs/videophy_5b 
+ --output_root outputs/videophy_detailed_5b 
  --mode baseline 
  --model_path zai-org/CogVideoX-5b 
  --num_inference_steps 50 
@@ -14,8 +14,8 @@ python inference/batch_generate_videophy.py
 
 ## 인덱스 지정하기
 python inference/batch_generate_videophy.py 
-  --prompts_path outputs/videophy.txt 
-  --output_root outputs/videophy_5b 
+  --prompts_path outputs/videophy_detailed.txt 
+  --output_root outputs/videophy_detailed_5b 
   --mode baseline 
   --model_path zai-org/CogVideoX-5b 
   --start_index 0 
