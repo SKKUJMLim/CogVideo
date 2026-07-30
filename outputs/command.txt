@@ -1,0 +1,47 @@
+==================================================================================================================================
+## Baseline
+python inference/cli_demo.py 
+--prompt 
+"텍스트 프롬프트 입력"
+--model_path zai-org/CogVideoX-5b 
+--generate_type t2v 
+--output_path outputs/baseline.mp4
+--num_inference_steps 50 --num_frames 49 --guidance_scale 6.0 --seed 42 --dtype float16 --fps 8
+
+
+##  Titan 방식
+python inference/cli_demo.py 
+--prompt 
+"텍스트 프롬프트 입력"
+--model_path zai-org/CogVideoX-5b 
+--generate_type t2v 
+--output_path outputs/titan_style.mp4 
+--num_inference_steps 50 
+--num_frames 49 --guidance_scale 6.0 --seed 42 --dtype float16 --fps 8 
+--physics_guidance_scale 0.01 
+--physics_guidance_start_step 0 
+--physics_guidance_end_step 49 
+--physics_guidance_interval 1 
+--physics_guidance_latent_epsilon 0.05 
+--physics_guidance_latent_directions 1 
+--physics_guidance_directions 1 
+
+## Titan 방식 x (--physics_guidance_current_decode)
+python inference/cli_demo.py 
+--prompt 
+"텍스트 프롬프트 입력"
+--model_path zai-org/CogVideoX-5b 
+--generate_type t2v 
+--output_path outputs/current_decode.mp4 
+--num_inference_steps 50 --num_frames 49 --guidance_scale 6.0 --seed 42 --dtype float16 --fps 8 
+--physics_guidance_scale 0.01
+--physics_guidance_start_step 0
+--physics_guidance_end_step 49
+--physics_guidance_interval 1
+--physics_guidance_latent_epsilon 0.05
+--physics_guidance_latent_directions 1
+--physics_guidance_directions 1
+--physics_guidance_device cuda 
+--physics_guidance_current_decode
+
+==================================================================================================================================
