@@ -1,4 +1,33 @@
-==================================================================================================================================
+========================영상을 여러개 생성하기========================
+## 전체 생성
+python inference/batch_generate_videophy.py 
+ --prompts_path outputs/videophy_detailed.txt 
+ --output_root outputs/videophy_5b 
+ --mode baseline 
+ --model_path zai-org/CogVideoX-5b 
+ --num_inference_steps 50 
+ --num_frames 49 
+ --guidance_scale 6.0 
+ --seed 42 
+ --dtype float16 
+ --fps 8
+
+## 인덱스 지정하기
+python inference/batch_generate_videophy.py 
+  --prompts_path outputs/videophy.txt 
+  --output_root outputs/videophy_5b 
+  --mode baseline 
+  --model_path zai-org/CogVideoX-5b 
+  --start_index 0 
+  --end_index 1 
+  --num_inference_steps 50 
+  --num_frames 49 
+  --guidance_scale 6.0 
+  --seed 42 
+  --dtype float16 
+  --fps 8
+
+========================영상을 하나씩 생성하기========================
 ## Baseline
 python inference/cli_demo.py 
 --prompt 
