@@ -72,6 +72,14 @@ def parse_args() -> argparse.Namespace:
         default=0.05,
         help="Fraction of highest-energy tokens summarized in the report.",
     )
+
+    parser.add_argument(
+        "--motion_ratio",
+        type=float,
+        default=0.25,
+        help="Fraction of tokens selected as motion-relevant using temporal L2 distance.",
+    )
+
     return parser.parse_args()
 
 
@@ -226,10 +234,115 @@ def summarize_map(values: torch.Tensor, topk_ratio: float) -> dict[str, Any]:
     }
 
 
+def aggregate_temporal_tokens(
+    temporal_cosine: torch.Tensor,
+    temporal_l2: torch.Tensor,
+    topk_ratio: float = 0.10,
+    motion_ratio: float = 0.25,
+) -> dict[str, Any]:
+    """
+    Compute three temporal-token aggregation scores.
+
+    1. 전체 평균:
+       모든 temporal cosine-distance token의 평균
+
+    2. Top-k 평균:
+       temporal cosine distance가 높은 상위 token의 평균
+
+    3. Motion-relevant 평균:
+       temporal L2 distance가 높은 token을 motion-relevant token으로 선택한 뒤,
+       해당 위치의 temporal cosine distance 평균
+    """
+    if temporal_cosine.shape != temporal_l2.shape:
+        raise ValueError(
+            "temporal_cosine and temporal_l2 must have the same shape: "
+            f"{temporal_cosine.shape} != {temporal_l2.shape}"
+        )
+
+    cosine_flat = temporal_cosine.detach().float().cpu().flatten()
+    l2_flat = temporal_l2.detach().float().cpu().flatten()
+
+    token_count = cosine_flat.numel()
+
+    if token_count == 0:
+        raise ValueError("No temporal tokens are available for aggregation.")
+
+    # ---------------------------------------------------------
+    # 1. 전체 token 평균
+    # ---------------------------------------------------------
+    all_mean = cosine_flat.mean()
+
+    # ---------------------------------------------------------
+    # 2. Temporal cosine distance 기준 Top-k 평균
+    # ---------------------------------------------------------
+    topk_count = max(
+        1,
+        min(token_count, math.ceil(token_count * topk_ratio)),
+    )
+
+    topk_values, topk_indices = torch.topk(
+        cosine_flat,
+        k=topk_count,
+        largest=True,
+    )
+
+    topk_mean = topk_values.mean()
+
+    # ---------------------------------------------------------
+    # 3. Temporal L2 기준 motion-relevant token 선택
+    # ---------------------------------------------------------
+    motion_count = max(
+        1,
+        min(token_count, math.ceil(token_count * motion_ratio)),
+    )
+
+    motion_l2_values, motion_indices = torch.topk(
+        l2_flat,
+        k=motion_count,
+        largest=True,
+    )
+
+    motion_cosine_values = cosine_flat[motion_indices]
+    motion_mean = motion_cosine_values.mean()
+
+    return {
+        "score_map": "temporal_cosine_distance",
+        "motion_selection_map": "temporal_l2_distance",
+        "token_count": int(token_count),
+
+        "all_token_mean": float(all_mean),
+
+        "topk": {
+            "ratio": float(topk_ratio),
+            "count": int(topk_count),
+            "mean": float(topk_mean),
+            "flat_indices": topk_indices[:20].tolist(),
+            "values": topk_values[:20].tolist(),
+        },
+
+        "motion_relevant": {
+            "selection_ratio": float(motion_ratio),
+            "count": int(motion_count),
+            "mean": float(motion_mean),
+            "selected_l2_mean": float(motion_l2_values.mean()),
+            "selected_l2_min": float(motion_l2_values.min()),
+            "flat_indices": motion_indices[:20].tolist(),
+            "cosine_values": motion_cosine_values[:20].tolist(),
+            "l2_values": motion_l2_values[:20].tolist(),
+        },
+    }
+
+
 def main() -> None:
     args = parse_args()
+
     if not 0.0 < args.topk_ratio <= 1.0:
         raise ValueError("--topk_ratio must be in the interval (0, 1].")
+
+    if not 0.0 < args.motion_ratio <= 1.0:
+        raise ValueError("--motion_ratio must be in the interval (0, 1].")
+
+
     if args.device.startswith("cpu") and args.dtype != "float32":
         raise ValueError("Use --dtype float32 on CPU.")
 
@@ -288,6 +401,21 @@ def main() -> None:
     )
     maps = compute_maps(grid)
 
+    if (
+            "temporal_cosine_distance" not in maps
+            or "temporal_l2_distance" not in maps
+    ):
+        raise RuntimeError(
+            "Temporal aggregation requires at least two temporal token frames."
+        )
+
+    temporal_token_aggregation = aggregate_temporal_tokens(
+        temporal_cosine=maps["temporal_cosine_distance"],
+        temporal_l2=maps["temporal_l2_distance"],
+        topk_ratio=args.topk_ratio,
+        motion_ratio=args.motion_ratio,
+    )
+
     report = {
         "video": str(args.video.resolve()),
         "model_path": args.model_path,
@@ -304,6 +432,9 @@ def main() -> None:
         "token_grid_shape_bthwd": list(grid.shape),
         "token_grid_thw": list(grid_shape),
         "has_cls_token": False,
+
+        "temporal_token_aggregation": temporal_token_aggregation,
+
         "maps": {
             name: summarize_map(values, args.topk_ratio)
             for name, values in maps.items()
@@ -325,6 +456,29 @@ def main() -> None:
         )
 
     print(json.dumps(report, indent=2))
+
+    aggregation = report["temporal_token_aggregation"]
+
+    print("\nTemporal token aggregation")
+    print("----------------------------------------")
+    print(
+        f"All-token mean       : "
+        f"{aggregation['all_token_mean']:.6f}"
+    )
+    print(
+        f"Top-{aggregation['topk']['ratio'] * 100:.1f}% mean    : "
+        f"{aggregation['topk']['mean']:.6f} "
+        f"({aggregation['topk']['count']} tokens)"
+    )
+    print(
+        f"Motion-relevant mean : "
+        f"{aggregation['motion_relevant']['mean']:.6f} "
+        f"({aggregation['motion_relevant']['count']} tokens, "
+        f"top {aggregation['motion_relevant']['selection_ratio'] * 100:.1f}% by L2)"
+    )
+    print("----------------------------------------")
+
+
     print(f"\nSaved report: {report_path}")
     print(f"Saved token maps: {maps_path}")
     if args.save_features:
@@ -342,5 +496,7 @@ if __name__ == "__main__":
        --device cuda 
        --dtype float16 
        --output_dir outputs/vjepa2_analysis/current_decode 
+       --topk_ratio 0.10 
+       --motion_ratio 0.25 
        --save_features
     """
