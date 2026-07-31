@@ -75,6 +75,9 @@ def generate_video(
     physics_guidance_frames: int = 16,
     physics_guidance_epsilon: float = 0.01,
     physics_guidance_directions: int = 1,
+    physics_guidance_token_aggregation: str = "pooled",
+    physics_guidance_token_topk_ratio: float = 0.10,
+    physics_guidance_motion_ratio: float = 0.25,
     physics_guidance_latent_epsilon: float = 0.05,
     physics_guidance_latent_directions: int = 4,
     physics_guidance_current_decode: bool = False,
@@ -180,6 +183,9 @@ def generate_video(
                 num_frames=physics_guidance_frames,
                 energy_epsilon=physics_guidance_epsilon,
                 energy_num_directions=physics_guidance_directions,
+                token_aggregation=physics_guidance_token_aggregation,
+                token_topk_ratio=physics_guidance_token_topk_ratio,
+                motion_ratio=physics_guidance_motion_ratio,
                 latent_epsilon=physics_guidance_latent_epsilon,
                 latent_num_directions=physics_guidance_latent_directions,
                 rollout_to_final=not physics_guidance_current_decode,
@@ -311,6 +317,27 @@ if __name__ == "__main__":
     parser.add_argument("--physics_guidance_epsilon", type=float, default=0.01)
     parser.add_argument("--physics_guidance_directions", type=int, default=1)
     parser.add_argument(
+        "--physics_guidance_token_aggregation",
+        choices=("pooled", "token_mean", "token_topk", "motion_topk"),
+        default="pooled",
+        help=(
+            "How V-JEPA perturbation sensitivity is aggregated. "
+            "'pooled' preserves the original baseline."
+        ),
+    )
+    parser.add_argument(
+        "--physics_guidance_token_topk_ratio",
+        type=float,
+        default=0.10,
+        help="Fraction of candidate tokens retained by top-k aggregation.",
+    )
+    parser.add_argument(
+        "--physics_guidance_motion_ratio",
+        type=float,
+        default=0.25,
+        help="Fraction of temporally changing tokens considered by motion_topk.",
+    )
+    parser.add_argument(
         "--physics_guidance_latent_epsilon", type=float, default=0.05
     )
     parser.add_argument(
@@ -363,6 +390,9 @@ if __name__ == "__main__":
         physics_guidance_frames=args.physics_guidance_frames,
         physics_guidance_epsilon=args.physics_guidance_epsilon,
         physics_guidance_directions=args.physics_guidance_directions,
+        physics_guidance_token_aggregation=args.physics_guidance_token_aggregation,
+        physics_guidance_token_topk_ratio=args.physics_guidance_token_topk_ratio,
+        physics_guidance_motion_ratio=args.physics_guidance_motion_ratio,
         physics_guidance_latent_epsilon=args.physics_guidance_latent_epsilon,
         physics_guidance_latent_directions=args.physics_guidance_latent_directions,
         physics_guidance_current_decode=args.physics_guidance_current_decode,

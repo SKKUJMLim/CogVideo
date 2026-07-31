@@ -10,7 +10,7 @@ import logging
 import math
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Dict
+from typing import Dict, Optional
 
 import torch
 import torch.nn.functional as F
@@ -30,6 +30,9 @@ class PhysicsGuidanceConfig:
     num_frames: int = 16
     energy_epsilon: float = 0.01
     energy_num_directions: int = 1
+    token_aggregation: str = "pooled"
+    token_topk_ratio: float = 0.10
+    motion_ratio: float = 0.25
     latent_epsilon: float = 0.05
     latent_num_directions: int = 1
     rollout_to_final: bool = True
@@ -53,6 +56,22 @@ class VJEPAPhysicsGuidance:
             raise ValueError("Energy epsilon must be greater than zero.")
         if config.energy_num_directions < 1:
             raise ValueError("Energy directions must be at least one.")
+        valid_aggregations = {
+            "pooled",
+            "token_mean",
+            "token_topk",
+            "motion_topk",
+        }
+        if config.token_aggregation not in valid_aggregations:
+            raise ValueError(
+                "Token aggregation must be one of "
+                f"{sorted(valid_aggregations)}, received "
+                f"{config.token_aggregation!r}."
+            )
+        if not 0 < config.token_topk_ratio <= 1:
+            raise ValueError("Token top-k ratio must be in (0, 1].")
+        if not 0 < config.motion_ratio <= 1:
+            raise ValueError("Motion ratio must be in (0, 1].")
         if config.latent_epsilon <= 0:
             raise ValueError("Latent finite-difference epsilon must be greater than zero.")
         if config.latent_num_directions < 1:
@@ -71,6 +90,8 @@ class VJEPAPhysicsGuidance:
             attn_implementation="sdpa",
         ).eval().to(self.device)
         self.model.requires_grad_(False)
+        self.patch_size = self._scalar_model_config("patch_size")
+        self.tubelet_size = self._scalar_model_config("tubelet_size")
 
         self.image_mean = torch.tensor(
             getattr(self.processor, "image_mean", [0.485, 0.456, 0.406]),
@@ -97,11 +118,27 @@ class VJEPAPhysicsGuidance:
             device=pipeline._execution_device
         ).manual_seed(config.seed + 1)
         logger.info(
-            "Loaded V-JEPA physics guide: model=%s, device=%s, scale=%g",
+            "Loaded V-JEPA physics guide: model=%s, device=%s, scale=%g, "
+            "token_aggregation=%s, token_topk_ratio=%g, motion_ratio=%g",
             config.model_id,
             self.device,
             config.scale,
+            config.token_aggregation,
+            config.token_topk_ratio,
+            config.motion_ratio,
         )
+
+    def _scalar_model_config(self, name: str) -> int:
+        value = getattr(self.model.config, name, None)
+        if value is None:
+            raise ValueError(f"V-JEPA model config is missing {name!r}.")
+        if isinstance(value, (tuple, list)):
+            if not value or len(set(value)) != 1:
+                raise ValueError(
+                    f"Expected scalar/equal-valued {name!r}, received {value!r}."
+                )
+            value = value[0]
+        return int(value)
 
     def _should_apply(self, step: int) -> bool:
         return (
@@ -130,18 +167,101 @@ class VJEPAPhysicsGuidance:
         video = video.to(device=self.device, dtype=self.dtype)
         return (video - self.image_mean) / self.image_std
 
-    def _features(self, video: torch.Tensor) -> torch.Tensor:
+    def _tokens(self, video: torch.Tensor) -> torch.Tensor:
         output = self.model(pixel_values_videos=video, skip_predictor=True)
-        return output.last_hidden_state.float().mean(dim=1)
+        tokens = output.last_hidden_state
+        if not isinstance(tokens, torch.Tensor) or tokens.ndim != 3:
+            shape = getattr(tokens, "shape", None)
+            raise RuntimeError(
+                "Expected V-JEPA dense tokens with shape [B,N,D], "
+                f"received {shape!r}."
+            )
+        return tokens.float()
+
+    def _token_grid(self, tokens: torch.Tensor, video: torch.Tensor) -> torch.Tensor:
+        _, frames, _, height, width = video.shape
+        t_grid = frames // self.tubelet_size
+        h_grid = height // self.patch_size
+        w_grid = width // self.patch_size
+        expected = t_grid * h_grid * w_grid
+        if tokens.shape[1] != expected:
+            raise RuntimeError(
+                "V-JEPA token-grid mismatch: "
+                f"N={tokens.shape[1]}, expected {t_grid}*{h_grid}*{w_grid}="
+                f"{expected}."
+            )
+        return tokens.reshape(
+            tokens.shape[0], t_grid, h_grid, w_grid, tokens.shape[-1]
+        )
+
+    def _select_token_indices(
+        self,
+        base_tokens: torch.Tensor,
+        token_sensitivity: torch.Tensor,
+        video: torch.Tensor,
+    ) -> torch.Tensor:
+        """Select one fixed token set per sample from the nominal video."""
+        if self.config.token_aggregation == "token_topk":
+            candidate_indices = torch.arange(
+                base_tokens.shape[1],
+                device=base_tokens.device,
+            ).expand(base_tokens.shape[0], -1)
+        elif self.config.token_aggregation == "motion_topk":
+            grid = self._token_grid(base_tokens, video)
+            if grid.shape[1] < 2:
+                raise ValueError(
+                    "motion_topk requires at least two temporal token slices. "
+                    "Increase --physics_guidance_frames."
+                )
+            motion = (
+                grid[:, 1:].float() - grid[:, :-1].float()
+            ).square().mean(dim=-1).sqrt().flatten(1)
+            motion_k = max(
+                1,
+                min(
+                    motion.shape[1],
+                    math.ceil(motion.shape[1] * self.config.motion_ratio),
+                ),
+            )
+            motion_relative_indices = motion.topk(motion_k, dim=1).indices
+            spatial_tokens = grid.shape[2] * grid.shape[3]
+            # Motion score at temporal difference t compares token t+1 to t,
+            # so sensitivity is evaluated at the later token t+1.
+            candidate_indices = motion_relative_indices + spatial_tokens
+        else:
+            raise RuntimeError(
+                "_select_token_indices is only valid for top-k aggregations."
+            )
+
+        candidate_sensitivity = token_sensitivity.gather(1, candidate_indices)
+        topk_count = max(
+            1,
+            min(
+                candidate_sensitivity.shape[1],
+                math.ceil(
+                    candidate_sensitivity.shape[1]
+                    * self.config.token_topk_ratio
+                ),
+            ),
+        )
+        relative_topk = candidate_sensitivity.topk(
+            topk_count, dim=1
+        ).indices
+        return candidate_indices.gather(1, relative_topk)
 
     @torch.no_grad()
-    def _video_energy(self, final_latents: torch.Tensor, probes=None):
+    def _video_energy(
+        self,
+        final_latents: torch.Tensor,
+        probes=None,
+        selected_indices: Optional[torch.Tensor] = None,
+    ):
         """Return per-sample JEPA energy for a predicted final video."""
         decoded = self.pipeline.decode_latents(final_latents)
         video = self._preprocess(decoded)
         del decoded
 
-        base_features = self._features(video)
+        base_tokens = self._tokens(video)
         if probes is None:
             probes = []
             for _ in range(self.config.energy_num_directions):
@@ -167,20 +287,52 @@ class VJEPAPhysicsGuidance:
                 f"received {len(probes)}."
             )
 
-        energies = []
+        direction_energies = []
         for probe in probes:
-            perturbed_features = self._features(
+            perturbed_tokens = self._tokens(
                 video + self.config.energy_epsilon * probe
             )
-            feature_jvp = (
-                perturbed_features - base_features
+            token_jvp = (
+                perturbed_tokens - base_tokens
             ) / self.config.energy_epsilon
-            energies.append(feature_jvp.square().mean(dim=1))
-            del perturbed_features, feature_jvp
+            if self.config.token_aggregation == "pooled":
+                direction_energies.append(
+                    token_jvp.mean(dim=1).square().mean(dim=-1)
+                )
+            else:
+                direction_energies.append(token_jvp.square().mean(dim=-1))
+            del perturbed_tokens, token_jvp
 
-        energy = torch.stack(energies, dim=0).mean(dim=0)
-        del video, base_features, energies
-        return energy, probes
+        if self.config.token_aggregation == "pooled":
+            # Preserve the original baseline exactly: mean tokens first, then
+            # square the perturbation response of the pooled feature.
+            energy = torch.stack(direction_energies, dim=0).mean(dim=0)
+        else:
+            token_energy = torch.stack(direction_energies, dim=0).mean(dim=0)
+
+        if self.config.token_aggregation == "token_mean":
+            energy = token_energy.mean(dim=1)
+        elif self.config.token_aggregation in {"token_topk", "motion_topk"}:
+            if selected_indices is None:
+                selected_indices = self._select_token_indices(
+                    base_tokens,
+                    token_energy,
+                    video,
+                )
+            elif (
+                selected_indices.ndim != 2
+                or selected_indices.shape[0] != token_energy.shape[0]
+            ):
+                raise ValueError(
+                    "selected_indices must have shape [B,K], received "
+                    f"{tuple(selected_indices.shape)}."
+                )
+            energy = token_energy.gather(1, selected_indices).mean(dim=1)
+
+        del video, base_tokens, direction_energies
+        if self.config.token_aggregation != "pooled":
+            del token_energy
+        return energy, probes, selected_indices
 
     @torch.no_grad()
     def _rollout_to_final(
@@ -334,6 +486,7 @@ class VJEPAPhysicsGuidance:
         prompt_embeds: torch.Tensor,
         negative_prompt_embeds: torch.Tensor,
         probes=None,
+        selected_indices=None,
     ):
         if self.config.rollout_to_final:
             final_latents = self._rollout_to_final(
@@ -344,9 +497,13 @@ class VJEPAPhysicsGuidance:
             )
         else:
             final_latents = latents
-        energy, probes = self._video_energy(final_latents, probes=probes)
+        energy, probes, selected_indices = self._video_energy(
+            final_latents,
+            probes=probes,
+            selected_indices=selected_indices,
+        )
         del final_latents
-        return energy, probes
+        return energy, probes, selected_indices
 
     def __call__(
         self, pipeline, step: int, timestep: torch.Tensor, callback_kwargs: Dict
@@ -370,8 +527,17 @@ class VJEPAPhysicsGuidance:
             positive_energies = []
             negative_energies = []
             energy_probes = None
+            selected_indices = None
             guidance_valid = True
             skip_reason = ""
+
+            if self.config.token_aggregation in {"token_topk", "motion_topk"}:
+                _, energy_probes, selected_indices = self._objective(
+                    latents,
+                    step,
+                    prompt_embeds,
+                    negative_prompt_embeds,
+                )
 
             for _ in range(self.config.latent_num_directions):
                 direction_fp32 = torch.randn(
@@ -400,19 +566,21 @@ class VJEPAPhysicsGuidance:
                     - self.config.latent_epsilon * direction_fp32
                 ).to(latents.dtype)
 
-                positive_energy, energy_probes = self._objective(
+                positive_energy, energy_probes, _ = self._objective(
                     positive_latents,
                     step,
                     prompt_embeds,
                     negative_prompt_embeds,
                     probes=energy_probes,
+                    selected_indices=selected_indices,
                 )
-                negative_energy, _ = self._objective(
+                negative_energy, _, _ = self._objective(
                     negative_latents,
                     step,
                     prompt_embeds,
                     negative_prompt_embeds,
                     probes=energy_probes,
+                    selected_indices=selected_indices,
                 )
                 del positive_latents, negative_latents
 
@@ -517,7 +685,8 @@ class VJEPAPhysicsGuidance:
             "positive_energy=%.6g negative_energy=%.6g "
             "derivative_mean=%.6g derivative_abs_mean=%.6g "
             "gradient_rms=%.6g update_rms=%.6g relative_update=%.6g "
-            "latent_directions=%d objective=%s mode=%s",
+            "latent_directions=%d objective=%s mode=%s "
+            "token_aggregation=%s selected_tokens=%s",
             step,
             timestep.item(),
             positive_energy_mean.item(),
@@ -530,5 +699,11 @@ class VJEPAPhysicsGuidance:
             self.config.latent_num_directions,
             "final_rollout" if self.config.rollout_to_final else "current_decode",
             "maximize" if self.config.maximize else "minimize",
+            self.config.token_aggregation,
+            (
+                str(selected_indices.shape[1])
+                if selected_indices is not None
+                else "all"
+            ),
         )
         return callback_kwargs

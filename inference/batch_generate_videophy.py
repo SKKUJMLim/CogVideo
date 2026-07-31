@@ -59,6 +59,15 @@ def parse_args():
     parser.add_argument("--physics_guidance_frames", type=int, default=16)
     parser.add_argument("--physics_guidance_epsilon", type=float, default=0.01)
     parser.add_argument("--physics_guidance_directions", type=int, default=1)
+    parser.add_argument(
+        "--physics_guidance_token_aggregation",
+        choices=("pooled", "token_mean", "token_topk", "motion_topk"),
+        default="pooled",
+    )
+    parser.add_argument(
+        "--physics_guidance_token_topk_ratio", type=float, default=0.10
+    )
+    parser.add_argument("--physics_guidance_motion_ratio", type=float, default=0.25)
     parser.add_argument("--physics_guidance_latent_epsilon", type=float, default=0.05)
     parser.add_argument("--physics_guidance_latent_directions", type=int, default=1)
     parser.add_argument("--physics_guidance_device", default="cuda")
@@ -135,6 +144,13 @@ def prepare_metadata(args, prompts, output_root):
         "width": args.width,
         "fps": args.fps,
         "dtype": args.dtype,
+        "physics_guidance_token_aggregation": (
+            args.physics_guidance_token_aggregation
+        ),
+        "physics_guidance_token_topk_ratio": (
+            args.physics_guidance_token_topk_ratio
+        ),
+        "physics_guidance_motion_ratio": args.physics_guidance_motion_ratio,
     }
     (output_root / "experiment.json").write_text(
         json.dumps(experiment, ensure_ascii=False, indent=2) + "\n",
@@ -177,6 +193,9 @@ def build_physics_guidance(args, pipe, seed):
             num_frames=args.physics_guidance_frames,
             energy_epsilon=args.physics_guidance_epsilon,
             energy_num_directions=args.physics_guidance_directions,
+            token_aggregation=args.physics_guidance_token_aggregation,
+            token_topk_ratio=args.physics_guidance_token_topk_ratio,
+            motion_ratio=args.physics_guidance_motion_ratio,
             latent_epsilon=args.physics_guidance_latent_epsilon,
             latent_num_directions=args.physics_guidance_latent_directions,
             rollout_to_final=False,
